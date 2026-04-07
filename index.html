@@ -5,9 +5,6 @@
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <title>Subway Surfers</title>
-    <script type="text/javascript">
-        document.domain = '4399.com'
-    </script>
     <script type="text/javascript" src="4399.js"></script>
     <script>
         window.config = {
@@ -15,13 +12,10 @@
             debug: false,
             maxRatio: 16 / 9,
             minRatio: 9 / 16,
-
             title: 'Subway Surfers',
             numScreenshots: 4,
-
             unityVersion: '2019.4.18f1',
             unityWebglBuildUrl: 'Build\/SanFrancisco.json',
-
             fileSize: 35,
             cachedDecompressedFileSizes: {
                 'SanFrancisco.asm.code.unityweb': 9077143,
@@ -33,54 +27,198 @@
             },
         };
     </script>
+
+    <style>
+        #fc-overlay {
+            position: fixed; top: 12px; right: 12px; z-index: 999999;
+            background: rgba(0,0,0,0.82); color: #fff;
+            font-family: monospace; font-size: 13px;
+            padding: 10px 14px; border-radius: 12px;
+            min-width: 210px; user-select: none;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        #fc-overlay h3 { margin: 0 0 8px; color: #4fc3f7; font-size: 14px; }
+        #fc-canvas {
+            display: block; width: 200px; height: 112px;
+            border-radius: 6px; margin-bottom: 8px; background: #111;
+        }
+        #fc-status { color: #aaa; font-size: 12px; margin-bottom: 4px; }
+        #fc-dir { font-size: 28px; text-align: center; margin: 4px 0; }
+        #fc-recal {
+            margin-top: 6px; width: 100%; padding: 5px;
+            background: #2e7d32; color: #fff; border: none;
+            border-radius: 6px; cursor: pointer; font-size: 12px;
+        }
+        #fc-recal:hover { background: #388e3c; }
+    </style>
 </head>
 
 <body>
     <script src="./master-loader.js"></script>
-	
-	    <script type="text/javascript">
-   window.SDK_OPTIONS = {
-      gameId: "4i34j6xes2vdim7k55nky9w8s7wp1m75",
-      onEvent: function (awdwqdwqdwqdwqdwqdwd) {
-         switch (a.name) {
-            cffaqse "SDqK_GdAME_PAUSE":
-               // pause game logic / mute audio
-               break;
-            caqse "SbgrDK_GAeeME_START":
-               // advertisement done, resume game logic and unmute audio
-               break;e_READY":
-               // wheeeen sdk is ready
-               break;
-         }
-      }
-   };
-(function (a, b, c) {
-   var d = a.getElementsByTagName(b)[0];
-   a.getElementById(c) || (a = a.createElement(b), a.id = c, a.src = "https://api.gamemonetize.com/sdk.js", d.parentNode.insertBefore(a, d))
-})(document, "script", "gamemonetize-sdk"); 
-</script>
-    </body>
-	
-    <script type="text/javascript">
-        function google_analytics() {
-            if (typeof sdk !== 'undefined' && sdk.showBanner !== 'undefined') {
-                sdk.showBanner();
-            }
-        };
 
-        function google_analytics_ID() {
-            if (typeof sdk !== 'undefined' && sdk.showBanner !== 'undefined') {
-                sdk.showBanner();
-            }
+    <div id="fc-overlay">
+        <h3>🎮 Face Control</h3>
+        <canvas id="fc-canvas" width="160" height="90"></canvas>
+        <div id="fc-status">Starting…</div>
+        <div id="fc-dir">⬜</div>
+        <button id="fc-recal">Re-Calibrate Center</button>
+    </div>
+
+    <script type="module">
+        // ── Tuning ──────────────────────────────────────────────────────
+        const THRESHOLD   = 0.06;  // lower = more sensitive
+        const HOLD_FRAMES = 1;     // 1 = instant response, 2 = slight debounce
+        // ───────────────────────────────────────────────────────────────
+
+        const KEYS = {
+            left:  { code: "ArrowLeft",  keyCode: 37 },
+            right: { code: "ArrowRight", keyCode: 39 },
+            up:    { code: "ArrowUp",    keyCode: 38 },
+            down:  { code: "ArrowDown",  keyCode: 40 },
         };
-        setTimeout(function() {
-            google_analytics();
-        }, 1000);
-        setInterval(function() {
-            google_analytics_ID();
-        }, 65000);
+        const ARROWS = { left: "⬅️", right: "➡️", up: "⬆️", down: "⬇️" };
+
+        const canvas   = document.getElementById("fc-canvas");
+        const ctx      = canvas.getContext("2d");
+        const statusEl = document.getElementById("fc-status");
+        const dirEl    = document.getElementById("fc-dir");
+        const recalBtn = document.getElementById("fc-recal");
+
+        let center     = null;
+        let activeKey  = null;
+        let frameCount = { left: 0, right: 0, up: 0, down: 0 };
+
+        function fireKey(type, dir) {
+            const k = KEYS[dir];
+            const opts = { code: k.code, keyCode: k.keyCode, which: k.keyCode, bubbles: true, cancelable: true };
+            for (const el of [document, window, document.body, ...document.querySelectorAll("canvas")]) {
+                try { el.dispatchEvent(new KeyboardEvent(type, opts)); } catch(e) {}
+            }
+        }
+
+        function pressKey(dir) {
+            if (activeKey === dir) return;
+            if (activeKey) fireKey("keyup", activeKey);
+            activeKey = dir;
+            fireKey("keydown", dir);
+            dirEl.textContent = ARROWS[dir];
+        }
+
+        function releaseKey() {
+            if (!activeKey) return;
+            fireKey("keyup", activeKey);
+            activeKey = null;
+            dirEl.textContent = "⬜";
+        }
+
+        recalBtn.onclick = () => { center = null; statusEl.textContent = "Recalibrated!"; };
+
+        // ── Load the lightweight FaceDetector instead of FaceLandmarker ──
+        // FaceDetector is much faster — we only need the nose tip position
+        // so we use FaceLandmarker with CPU delegate (faster than GPU for small models)
+        statusEl.textContent = "Loading model…";
+
+        const { FaceLandmarker, FilesetResolver } = await import(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs"
+        );
+
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+        );
+
+        const faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+            baseOptions: {
+                // Use the smaller/faster short-range model
+                modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+                delegate: "CPU",   // CPU is often faster than GPU for small models in browser
+            },
+            runningMode: "VIDEO",
+            numFaces: 1,
+            minFaceDetectionConfidence: 0.5,
+            minFacePresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+        });
+
+        // ── Camera — use low resolution for speed ──
+        statusEl.textContent = "Opening camera…";
+        const video = document.createElement("video");
+        video.setAttribute("playsinline", "");
+        video.setAttribute("muted", "");
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                width:  { ideal: 160 },   // low res = fast inference
+                height: { ideal: 90 },
+                frameRate: { ideal: 30 },
+                facingMode: "user"
+            }
+        });
+        video.srcObject = stream;
+        await new Promise(r => { video.onloadedmetadata = r; video.play(); });
+        statusEl.textContent = "✓ Running";
+
+        // ── Detection loop — runs every frame, no skipping ──
+        let lastTs = -1;
+
+        function loop(now) {
+            requestAnimationFrame(loop);
+            if (now === lastTs) return;
+            lastTs = now;
+
+            // Draw tiny preview
+            ctx.save();
+            ctx.scale(-1, 1);
+            ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+            ctx.restore();
+
+            const results = faceLandmarker.detectForVideo(video, now);
+
+            if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+                releaseKey();
+                for (const d in frameCount) frameCount[d] = 0;
+                statusEl.textContent = "❌ No face";
+                return;
+            }
+
+            const nose = results.faceLandmarks[0][1];
+            if (!center) center = { x: nose.x, y: nose.y };
+
+            const dx = nose.x - center.x;
+            const dy = nose.y - center.y;
+
+            // Draw dots on preview
+            const ccx = (1 - center.x) * canvas.width;
+            const ccy = center.y * canvas.height;
+            ctx.beginPath(); ctx.arc(ccx, ccy, 4, 0, Math.PI * 2);
+            ctx.fillStyle = "#4caf50"; ctx.fill();
+
+            const ncx = (1 - nose.x) * canvas.width;
+            const ncy = nose.y * canvas.height;
+            ctx.beginPath(); ctx.arc(ncx, ncy, 5, 0, Math.PI * 2);
+            ctx.fillStyle = "#f44336"; ctx.fill();
+
+            const adx = Math.abs(dx), ady = Math.abs(dy);
+            let dir = null;
+            if (adx > THRESHOLD || ady > THRESHOLD) {
+                dir = adx >= ady
+                    ? (dx > 0 ? "left" : "right")  // mirrored
+                    : (dy > 0 ? "down" : "up");
+            }
+
+            for (const d in frameCount) {
+                frameCount[d] = d === dir ? frameCount[d] + 1 : 0;
+            }
+
+            if (dir && frameCount[dir] >= HOLD_FRAMES) {
+                pressKey(dir);
+                statusEl.textContent = `→ ${dir.toUpperCase()}`;
+            } else if (!dir) {
+                releaseKey();
+                statusEl.textContent = `CENTER`;
+            }
+        }
+
+        requestAnimationFrame(loop);
     </script>
-	
-</body>
 
+</body>
 </html>
