@@ -31,24 +31,17 @@
     <style>
         #fc-overlay {
             position: fixed; top: 12px; right: 12px; z-index: 999999;
-            background: rgba(0,0,0,0.82); color: #fff;
+            background: rgba(0,0,0,0.85); color: #fff;
             font-family: monospace; font-size: 13px;
             padding: 10px 14px; border-radius: 12px;
             min-width: 210px; user-select: none;
             box-shadow: 0 4px 20px rgba(0,0,0,0.5);
         }
-        #fc-overlay h3 { margin: 0 0 8px; color: #4fc3f7; font-size: 14px; }
-        #fc-canvas {
-            display: block; width: 200px; height: 112px;
-            border-radius: 6px; margin-bottom: 8px; background: #111;
-        }
-        #fc-status { color: #aaa; font-size: 12px; margin-bottom: 4px; }
-        #fc-dir { font-size: 28px; text-align: center; margin: 4px 0; }
-        #fc-recal {
-            margin-top: 6px; width: 100%; padding: 5px;
-            background: #2e7d32; color: #fff; border: none;
-            border-radius: 6px; cursor: pointer; font-size: 12px;
-        }
+        #fc-overlay h3  { margin: 0 0 8px; color: #4fc3f7; font-size: 14px; }
+        #fc-canvas      { display: block; width: 200px; height: 112px; border-radius: 6px; margin-bottom: 8px; background: #111; }
+        #fc-status      { color: #aaa; font-size: 12px; margin-bottom: 4px; min-height: 16px; }
+        #fc-dir         { font-size: 28px; text-align: center; margin: 4px 0; min-height: 36px; }
+        #fc-recal       { margin-top: 6px; width: 100%; padding: 5px; background: #2e7d32; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; }
         #fc-recal:hover { background: #388e3c; }
     </style>
 </head>
@@ -61,16 +54,28 @@
         <canvas id="fc-canvas" width="160" height="90"></canvas>
         <div id="fc-status">Starting…</div>
         <div id="fc-dir">⬜</div>
-        <button id="fc-recal">Re-Calibrate Center</button>
+        <button id="fc-recal">Re-Calibrate</button>
     </div>
 
     <script type="module">
-        // ── Tuning ──────────────────────────────────────────────────────
-        const THRESHOLD   = 0.06;  // lower = more sensitive
-        const HOLD_FRAMES = 1;     // 1 = instant response, 2 = slight debounce
-        // ───────────────────────────────────────────────────────────────
 
-        const KEYS = {
+        // ── Tuning ────────────────────────────────────────────────────────
+        const VELOCITY_THRESHOLD = 0.010; // min speed per frame  (raise if false triggers)
+        const DISTANCE_THRESHOLD = 0.06;  // min distance from center (raise if too sensitive)
+        const COOLDOWN_MS        = 400;   // ms between swipes
+        const DRIFT_RATE         = 0.12;  // how fast center follows nose at rest
+        const GRACE_FRAMES       = 8;     // frames to keep last known position when face lost
+                                          // prevents "no face" flash when looking down
+        // ─────────────────────────────────────────────────────────────────
+
+        // Using multiple landmarks averaged together gives a more stable
+        // tracking point that survives partial occlusion (looking down etc.)
+        // Landmarks: 1=nose tip, 4=nose bridge, 152=chin, 10=forehead
+        // We average nose tip + chin — chin stays visible when looking down,
+        // nose tip stays visible when looking up
+        const LANDMARK_INDICES = [1, 4, 152];
+
+        const KEY_CODES = {
             left:  { code: "ArrowLeft",  keyCode: 37 },
             right: { code: "ArrowRight", keyCode: 39 },
             up:    { code: "ArrowUp",    keyCode: 38 },
@@ -84,79 +89,90 @@
         const dirEl    = document.getElementById("fc-dir");
         const recalBtn = document.getElementById("fc-recal");
 
-        let center     = null;
-        let activeKey  = null;
-        let frameCount = { left: 0, right: 0, up: 0, down: 0 };
+        let center       = null;
+        let prevPoint    = null;   // previous averaged point
+        let lastSwipeAt  = 0;
+        let lostCounter  = 0;      // counts frames where face is not detected
+        let lastKnownPos = null;   // last position before face was lost
 
-        function fireKey(type, dir) {
-            const k = KEYS[dir];
-            const opts = { code: k.code, keyCode: k.keyCode, which: k.keyCode, bubbles: true, cancelable: true };
-            for (const el of [document, window, document.body, ...document.querySelectorAll("canvas")]) {
-                try { el.dispatchEvent(new KeyboardEvent(type, opts)); } catch(e) {}
+        // Average multiple landmarks into one stable point
+        function getTrackingPoint(landmarks) {
+            let x = 0, y = 0;
+            for (const idx of LANDMARK_INDICES) {
+                x += landmarks[idx].x;
+                y += landmarks[idx].y;
             }
+            return { x: x / LANDMARK_INDICES.length, y: y / LANDMARK_INDICES.length };
         }
 
-        function pressKey(dir) {
-            if (activeKey === dir) return;
-            if (activeKey) fireKey("keyup", activeKey);
-            activeKey = dir;
-            fireKey("keydown", dir);
-            dirEl.textContent = ARROWS[dir];
+        function dispatchKey(type, dir) {
+            const k = KEY_CODES[dir];
+            const opts = {
+                key: k.code, code: k.code,
+                keyCode: k.keyCode, which: k.keyCode,
+                bubbles: true, cancelable: true
+            };
+            [window, document, document.body, ...document.querySelectorAll("canvas")]
+                .forEach(el => { try { el.dispatchEvent(new KeyboardEvent(type, opts)); } catch(_) {} });
         }
 
-        function releaseKey() {
-            if (!activeKey) return;
-            fireKey("keyup", activeKey);
-            activeKey = null;
-            dirEl.textContent = "⬜";
+        function fireSwipe(dir) {
+            const now = performance.now();
+            if (now - lastSwipeAt < COOLDOWN_MS) return;
+            lastSwipeAt = now;
+
+            dispatchKey("keydown", dir);
+            setTimeout(() => dispatchKey("keyup", dir), 80);
+
+            dirEl.textContent    = ARROWS[dir];
+            statusEl.textContent = `✓ ${dir.toUpperCase()}`;
+            setTimeout(() => {
+                dirEl.textContent    = "⬜";
+                statusEl.textContent = "● Ready";
+            }, 350);
         }
 
-        recalBtn.onclick = () => { center = null; statusEl.textContent = "Recalibrated!"; };
+        recalBtn.addEventListener("click", () => {
+            center      = null;
+            prevPoint   = null;
+            lostCounter = 0;
+            statusEl.textContent = "Recalibrated!";
+        });
 
-        // ── Load the lightweight FaceDetector instead of FaceLandmarker ──
-        // FaceDetector is much faster — we only need the nose tip position
-        // so we use FaceLandmarker with CPU delegate (faster than GPU for small models)
+        // ── MediaPipe ────────────────────────────────────────────────────
         statusEl.textContent = "Loading model…";
-
         const { FaceLandmarker, FilesetResolver } = await import(
             "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs"
         );
-
         const filesetResolver = await FilesetResolver.forVisionTasks(
             "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
         );
-
-        const faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        const landmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
             baseOptions: {
-                // Use the smaller/faster short-range model
                 modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-                delegate: "CPU",   // CPU is often faster than GPU for small models in browser
+                delegate: "CPU",
             },
             runningMode: "VIDEO",
             numFaces: 1,
-            minFaceDetectionConfidence: 0.5,
-            minFacePresenceConfidence: 0.5,
-            minTrackingConfidence: 0.5,
+            minFaceDetectionConfidence: 0.4,  // slightly lower so partial face still tracks
+            minFacePresenceConfidence:  0.4,
+            minTrackingConfidence:      0.4,
         });
 
-        // ── Camera — use low resolution for speed ──
+        // ── Camera ───────────────────────────────────────────────────────
         statusEl.textContent = "Opening camera…";
         const video = document.createElement("video");
         video.setAttribute("playsinline", "");
         video.setAttribute("muted", "");
         const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-                width:  { ideal: 160 },   // low res = fast inference
-                height: { ideal: 90 },
-                frameRate: { ideal: 30 },
-                facingMode: "user"
-            }
+            video: { facingMode: "user", width: { ideal: 160 }, height: { ideal: 90 }, frameRate: { ideal: 30 } }
         });
         video.srcObject = stream;
-        await new Promise(r => { video.onloadedmetadata = r; video.play(); });
-        statusEl.textContent = "✓ Running";
+        await new Promise(r => { video.onloadedmetadata = r; });
+        await video.play();
+        statusEl.textContent = "● Ready";
 
-        // ── Detection loop — runs every frame, no skipping ──
+        // ── Main loop ─────────────────────────────────────────────────────
         let lastTs = -1;
 
         function loop(now) {
@@ -164,56 +180,121 @@
             if (now === lastTs) return;
             lastTs = now;
 
-            // Draw tiny preview
+            // Draw mirrored preview
             ctx.save();
             ctx.scale(-1, 1);
             ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
             ctx.restore();
 
-            const results = faceLandmarker.detectForVideo(video, now);
+            const results = landmarker.detectForVideo(video, now);
+            const faceFound = results.faceLandmarks && results.faceLandmarks.length > 0;
 
-            if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
-                releaseKey();
-                for (const d in frameCount) frameCount[d] = 0;
-                statusEl.textContent = "❌ No face";
+            let point;
+
+            if (faceFound) {
+                // Face detected — use averaged tracking point
+                point        = getTrackingPoint(results.faceLandmarks[0]);
+                lastKnownPos = { x: point.x, y: point.y };
+                lostCounter  = 0;
+            } else {
+                // Face not detected — use grace period
+                lostCounter++;
+                if (lostCounter <= GRACE_FRAMES && lastKnownPos) {
+                    // Within grace period: pretend face is still at last known position
+                    point = lastKnownPos;
+                    statusEl.textContent = "⚠ Tracking…";
+                } else {
+                    // Grace period expired: truly lost
+                    prevPoint = null;
+                    statusEl.textContent = "❌ No face";
+                    return;
+                }
+            }
+
+            // Init on first frame
+            if (!center) {
+                center    = { x: point.x, y: point.y };
+                prevPoint = { x: point.x, y: point.y };
+                statusEl.textContent = "● Ready";
                 return;
             }
 
-            const nose = results.faceLandmarks[0][1];
-            if (!center) center = { x: nose.x, y: nose.y };
+            // ── Velocity (frame-to-frame speed) ──────────────────────────
+            const vx    = point.x - prevPoint.x;
+            const vy    = point.y - prevPoint.y;
+            const speed = Math.sqrt(vx * vx + vy * vy);
 
-            const dx = nose.x - center.x;
-            const dy = nose.y - center.y;
+            // ── Distance from center ──────────────────────────────────────
+            const dx   = point.x - center.x;
+            const dy   = point.y - center.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
 
-            // Draw dots on preview
-            const ccx = (1 - center.x) * canvas.width;
-            const ccy = center.y * canvas.height;
-            ctx.beginPath(); ctx.arc(ccx, ccy, 4, 0, Math.PI * 2);
-            ctx.fillStyle = "#4caf50"; ctx.fill();
-
-            const ncx = (1 - nose.x) * canvas.width;
-            const ncy = nose.y * canvas.height;
-            ctx.beginPath(); ctx.arc(ncx, ncy, 5, 0, Math.PI * 2);
-            ctx.fillStyle = "#f44336"; ctx.fill();
-
-            const adx = Math.abs(dx), ady = Math.abs(dy);
-            let dir = null;
-            if (adx > THRESHOLD || ady > THRESHOLD) {
-                dir = adx >= ady
-                    ? (dx > 0 ? "left" : "right")  // mirrored
-                    : (dy > 0 ? "down" : "up");
+            // ── Swipe: BOTH speed AND distance must exceed thresholds ──────
+            // Speed  → rules out slow posture drift
+            // Distance → rules out fast but tiny vibration/noise
+            if (speed > VELOCITY_THRESHOLD && dist > DISTANCE_THRESHOLD) {
+                const dir = Math.abs(vx) >= Math.abs(vy)
+                    ? (vx > 0 ? "left" : "right")  // mirrored
+                    : (vy > 0 ? "down" : "up");
+                fireSwipe(dir);
             }
 
-            for (const d in frameCount) {
-                frameCount[d] = d === dir ? frameCount[d] + 1 : 0;
+            // ── Center drifts toward nose when idle ───────────────────────
+            // Only drift when not swiping, so intentional moves still register
+            if (speed <= VELOCITY_THRESHOLD) {
+                center.x += (point.x - center.x) * DRIFT_RATE;
+                center.y += (point.y - center.y) * DRIFT_RATE;
             }
 
-            if (dir && frameCount[dir] >= HOLD_FRAMES) {
-                pressKey(dir);
-                statusEl.textContent = `→ ${dir.toUpperCase()}`;
-            } else if (!dir) {
-                releaseKey();
-                statusEl.textContent = `CENTER`;
+            prevPoint = { x: point.x, y: point.y };
+
+            // ── Draw preview ──────────────────────────────────────────────
+            const cw = canvas.width;
+            const ch = canvas.height;
+
+            const velRatio  = Math.min(speed / VELOCITY_THRESHOLD, 1);
+            const distRatio = Math.min(dist  / DISTANCE_THRESHOLD, 1);
+            // Both must be high to trigger — show the lower one as the limiter
+            const triggerRatio = Math.min(velRatio, distRatio);
+
+            // Center dot (green)
+            const ccx = (1 - center.x) * cw;
+            const ccy = center.y * ch;
+            ctx.beginPath();
+            ctx.arc(ccx, ccy, 4, 0, Math.PI * 2);
+            ctx.fillStyle = "#4caf50";
+            ctx.fill();
+
+            // Distance circle around center
+            ctx.beginPath();
+            ctx.arc(ccx, ccy, DISTANCE_THRESHOLD * cw, 0, Math.PI * 2);
+            ctx.strokeStyle = triggerRatio > 0.7 ? "rgba(255,200,0,0.6)" : "rgba(255,255,255,0.15)";
+            ctx.lineWidth   = 1.5;
+            ctx.stroke();
+            ctx.lineWidth   = 1;
+
+            // Tracking point dot — color reflects how close to triggering
+            const pcx = (1 - point.x) * cw;
+            const pcy = point.y * ch;
+            ctx.beginPath();
+            ctx.arc(pcx, pcy, 5, 0, Math.PI * 2);
+            ctx.fillStyle = triggerRatio > 0.85
+                ? "#ffeb3b"          // yellow — about to fire
+                : faceFound
+                    ? "#f44336"      // red — tracking fine
+                    : "#ff9800";     // orange — grace period
+            ctx.fill();
+
+            // Speed bar at bottom
+            const barW = Math.round(velRatio * (cw - 4));
+            ctx.fillStyle = `hsl(${Math.round(120 - velRatio * 120)}, 100%, 50%)`;
+            ctx.fillRect(2, ch - 6, barW, 4);
+            ctx.strokeStyle = "rgba(255,255,255,0.1)";
+            ctx.strokeRect(2, ch - 6, cw - 4, 4);
+
+            // Status text when ready
+            if (faceFound && performance.now() - lastSwipeAt > 400) {
+                statusEl.textContent = `spd:${speed.toFixed(3)} dst:${dist.toFixed(3)}`;
             }
         }
 
